@@ -1,0 +1,20 @@
+@import "tailwindcss";
+
+@theme {
+  --color-chef-orange: #D97706;
+  --color-chef-orange-light: #F59E0B;
+  --color-chef-orange-dark: #B45309;
+  --color-chef-cream: #FEF3E2;
+  --color-chef-peach: #FED7AA;
+} 
+
+@custom-variant dark (&:where(.dark, .dark *)); 
+
+.blinking-cursor {
+  animation: blink 1s steps(1) infinite;
+}
+
+@keyframes blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
