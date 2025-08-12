@@ -5,7 +5,7 @@ import { useUser } from '../store';
 
 // Import all AI components
 import AiHeader from '../components/ai/AiHeader';
-import AiGreeting, { LoadingChatMessage } from '../components/ai/AiGreeting';
+import AiGreeting from '../components/ai/AiGreeting';
 import ChatMessages from '../components/ai/ChatMessages';
 import AiInput from '../components/ai/AiInput';
 import HistoryPanel from '../components/ai/HistoryPanel';
@@ -15,11 +15,12 @@ import AiStyles from '../components/ai/AiStyles';
 // Import constants and utilities
 import { restrictionsList } from '../components/ai/constants';
 import { formatRecipeDisplay } from '../components/ai/utils';
+import { StreamingRecipeFormatter } from '../components/ai/streamingFormatter.js';
 
 const Ai = () => {
   const { chatId } = useParams();
   const navigate = useNavigate();
-  const { userData } = useUser();
+  const { userData, isAuthenticated, loading } = useUser();
   
   // Store all selected chats for scrollable middle section
   const [activeChats, setActiveChats] = useState([]);
@@ -42,6 +43,9 @@ const Ai = () => {
     ingredients: [],
     instructions: [],
   });
+  
+  // Keep a backup of the original recipe data from sessionStorage
+  const [backupOriginalRecipe, setBackupOriginalRecipe] = useState(null);
 
   // Speech recognition state
   const [isListening, setIsListening] = useState(false);
@@ -52,6 +56,25 @@ const Ai = () => {
 
   // Copy to clipboard for history
   const [copiedIdx, setCopiedIdx] = useState(null);
+
+  // Helper function to format streaming JSON into readable recipe
+  // Create a ref to store the streaming formatter instance
+  const streamingFormatterRef = useRef(null);
+
+  // Initialize formatter when streaming starts
+  const initializeStreamingFormatter = () => {
+    streamingFormatterRef.current = new StreamingRecipeFormatter();
+  };
+
+  // Helper function to process streaming chunk with formatter
+  const processStreamingChunk = (chunk) => {
+    if (!streamingFormatterRef.current) {
+      initializeStreamingFormatter();
+    }
+    
+    streamingFormatterRef.current.addChunk(chunk);
+    return streamingFormatterRef.current.getFormattedOutput();
+  };
 
   // UI state
   const [input, setInput] = useState("");
@@ -64,6 +87,12 @@ const Ai = () => {
   const [showHistory, setShowHistory] = useState(false);
   const [selectedHistoryIdx, setSelectedHistoryIdx] = useState(null);
   const [showDropdown, setShowDropdown] = useState(false);
+  
+  // Streaming state
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [streamingOutput, setStreamingOutput] = useState("");
+  const [currentEventSource, setCurrentEventSource] = useState(null);
+  const [streamingBuffer, setStreamingBuffer] = useState(""); // Buffer for incomplete JSON
 
   const loadUserData = useCallback(async () => {
     try {
@@ -91,6 +120,36 @@ const Ai = () => {
     }
   }, []);
 
+  // Helper function to sync messages to activeChats format
+  const syncMessagesToActiveChats = useCallback((messagesArray) => {
+    const convertedChats = [];
+    
+    for (let i = 0; i < messagesArray.length; i += 2) {
+      const userMessage = messagesArray[i];
+      const aiMessage = messagesArray[i + 1];
+      
+      if (userMessage && aiMessage && userMessage.role === 'user' && aiMessage.role === 'ai') {
+        // Format the output using the same logic as new responses
+        let formattedOutput = aiMessage.content;
+        if (aiMessage.recipeData && typeof aiMessage.recipeData === 'object') {
+          formattedOutput = formatRecipeDisplay(aiMessage.recipeData, aiMessage.type || 'idea');
+        }
+        
+        const chatEntry = {
+          input: userMessage.content,
+          output: formattedOutput,
+          recipeData: aiMessage.recipeData,
+          restrictions: aiMessage.dietaryRestrictions?.join(', ') || 'None',
+          mode: aiMessage.type || 'idea',
+          timestamp: aiMessage.createdAt || aiMessage.timestamp || new Date().toLocaleString()
+        };
+        convertedChats.push(chatEntry);
+      }
+    }
+    
+    return convertedChats;
+  }, []);
+
   // Load specific chat by ID (for URL navigation)
   const loadSpecificChat = useCallback(async (chatId) => {
     try {
@@ -101,40 +160,22 @@ const Ai = () => {
         
         // Load previous messages and convert them to activeChats format
         const messages = chatData.messages || [];
-        const convertedChats = [];
-        
-        for (let i = 0; i < messages.length; i += 2) {
-          const userMessage = messages[i];
-          const aiMessage = messages[i + 1];
-          
-          if (userMessage && aiMessage && userMessage.role === 'user' && aiMessage.role === 'ai') {
-            // Format the output using the same logic as new responses
-            let formattedOutput = aiMessage.content;
-            if (aiMessage.recipeData && typeof aiMessage.recipeData === 'object') {
-              formattedOutput = formatRecipeDisplay(aiMessage.recipeData, aiMessage.type || 'idea');
-            }
-            
-            const chatEntry = {
-              input: userMessage.content,
-              output: formattedOutput,
-              recipeData: aiMessage.recipeData,
-              restrictions: aiMessage.dietaryRestrictions?.join(', ') || 'Previous Chat',
-              mode: aiMessage.type || 'idea',
-              timestamp: aiMessage.createdAt || aiMessage.timestamp || new Date().toLocaleString()
-            };
-            convertedChats.push(chatEntry);
-          }
-        }
+        const convertedChats = syncMessagesToActiveChats(messages);
         
         setActiveChats(convertedChats);
         setMessages(messages);
+        
+        // Set output to the last AI response for consistency
+        if (convertedChats.length > 0) {
+          setOutput(convertedChats[convertedChats.length - 1].output);
+        }
       }
     } catch (error) {
       console.error("Failed to load specific chat:", error);
     } finally {
       setIsLoadingChat(false);
     }
-  }, []);
+  }, [syncMessagesToActiveChats]);
 
   // Load chat history from backend
   const loadChatHistory = useCallback(async () => {
@@ -170,26 +211,89 @@ const Ai = () => {
     loadChatHistory();
   }, [loadUserData, loadChatHistory]);
 
+  // Authentication check
+  useEffect(() => {
+    if (!loading && !isAuthenticated) {
+      console.warn('User not authenticated, redirecting to home');
+      navigate('/');
+    }
+  }, [loading, isAuthenticated, navigate]);
+
   // Load chat based on URL parameter
   useEffect(() => {
     if (chatId) {
-      loadSpecificChat(chatId);
+      // Only load specific chat if we're not currently streaming
+      // This prevents clearing activeChats during new chat creation
+      if (!isStreaming) {
+        loadSpecificChat(chatId);
+      }
     } else {
-      // Clear current chat when no chatId is present
-      setCurrentChat(null);
-      setActiveChats([]);
-      setMessages([]);
-      setOutput("");
-      setError("");
+      // Clear current chat when no chatId is present (only if not streaming)
+      if (!isStreaming) {
+        setCurrentChat(null);
+        setActiveChats([]);
+        setMessages([]);
+        setOutput("");
+        setError("");
+      }
     }
-  }, [chatId, loadSpecificChat]);
+  }, [chatId, loadSpecificChat, isStreaming]);
 
-  const createNewChat = async () => {
+  // Handle URL parameters for recipe adaptation
+  useEffect(() => {
+    const urlParams = new URLSearchParams(window.location.search);
+    const mode = urlParams.get('mode');
+    const action = urlParams.get('action');
+    
+    // Check if this is a recipe adaptation request
+    if (mode === 'adapt' && action === 'adapt-recipe') {
+      const adaptData = sessionStorage.getItem('adaptRecipeData');
+      
+      if (adaptData) {
+        try {
+          const { recipeId, recipeTitle, prompt } = JSON.parse(adaptData);
+          
+          console.log('Retrieved adapt data from sessionStorage:', { recipeId, recipeTitle });
+          console.log('Setting selectedMode to adapt and recipeId to:', recipeId);
+          
+          // Set the mode to adapt
+          setSelectedMode('adapt');
+          
+          // Store recipe ID and title for adaptation
+          setRecipeId(recipeId);
+          setOriginalRecipe({
+            title: recipeTitle || '',
+            ingredients: [],
+            instructions: []
+          });
+          
+          // Pre-fill the input with the adaptation prompt
+          setInput(prompt || '');
+          
+          // Clear the stored data after using it
+          sessionStorage.removeItem('adaptRecipeData');
+          
+          // Clear URL parameters to clean up the URL
+          const newUrl = window.location.pathname;
+          window.history.replaceState({}, '', newUrl);
+          
+        } catch (error) {
+          console.error('Error parsing recipe adaptation data:', error);
+        }
+      }
+    }
+  }, []); // Run only once on component mount
+
+  // Simplified chat creation function - only creates chat, no state changes
+  const createNewChat = async (userInput = "") => {
     try {
-      const chat = await aiService.createChat("Recipe Generation Chat");
-      setCurrentChat(chat);
-      // Navigate to the new chat URL
-      navigate(`/ai/${chat._id}`);
+      // Create a dynamic title based on user input
+      const chatTitle = userInput 
+        ? `Recipe: ${userInput.substring(0, 30)}${userInput.length > 30 ? '...' : ''}`
+        : "New Recipe Chat";
+        
+      const chat = await aiService.createChat(chatTitle);
+      
       // Refresh chat history to include new chat
       loadChatHistory();
       return chat;
@@ -201,12 +305,30 @@ const Ai = () => {
 
   const startNewChat = async () => {
     try {
+      // Clear all chat-related state
       setCurrentChat(null);
       setActiveChats([]);
       setMessages([]);
       setOutput("");
       setError("");
       setInput("");
+      setStreamingOutput("");
+      setHistory([]);
+      
+      // Clear adaptation state
+      setRecipeId("");
+      setOriginalRecipe({
+        title: "",
+        ingredients: [],
+        instructions: [],
+      });
+      
+      // Reset streaming formatter
+      if (streamingFormatterRef.current) {
+        streamingFormatterRef.current.reset();
+      }
+      
+      // Navigate to clean AI page
       navigate("/ai");
     } catch (error) {
       console.error("Failed to start new chat:", error);
@@ -272,29 +394,9 @@ const Ai = () => {
     const item = history[idx];
     if (!item) return;
     
-    // If item has chatId, navigate to that chat
-    if (item.chatId) {
       navigate(`/ai/${item.chatId}`);
       setShowHistory(false);
       return;
-    }
-    
-    // Fallback for old history items without chatId
-    setInput(item.input);
-    setSelectedMode(item.mode);
-    setOutput(item.output);
-    setSelectedHistoryIdx(idx);
-    setShowHistory(false);
-    
-    const restrictionLabels = item.restrictions.split(",").map((l) => l.trim());
-    const restrictionIds = restrictionsList
-      .filter((r) => restrictionLabels.includes(r.label))
-      .map((r) => r.id);
-    setSelectedRestrictions(restrictionIds);
-    setActiveChats((prev) => {
-      if (prev.find((c) => c.timestamp === item.timestamp)) return prev;
-      return [...prev, item];
-    });
   };
 
   // Handle copy to clipboard
@@ -342,23 +444,38 @@ const Ai = () => {
     }
   };
 
-  // Generate recipe with backend integration
+  // Generate recipe with backend integration and streaming
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!input.trim()) return;
+    if (!input.trim() || isLoading || isStreaming) return;
 
-    setIsLoading(true);
+    // Check authentication before making API calls
+    if (!isAuthenticated || !userData) {
+      setError("Please log in to generate recipes.");
+      return;
+    }
+
+    const userInput = input.trim();
+    setInput(""); // Clear input immediately
     setError("");
 
     try {
-      let response;
       let currentChatId = chatId; // Use chatId from URL params
 
       // Create new chat if none exists
       if (!currentChatId) {
         try {
-          const newChat = await createNewChat();
+          setIsLoading(true);
+          const newChat = await createNewChat(userInput); // Pass user input for title
           currentChatId = newChat._id;
+          
+          // Set the current chat immediately
+          setCurrentChat(newChat);
+          
+          // Don't navigate immediately - let the streaming complete first
+          // We'll navigate after the message is added to activeChats
+          
+          setIsLoading(false);
         } catch (chatError) {
           setError("Failed to create chat session. Please try again.");
           setIsLoading(false);
@@ -366,66 +483,653 @@ const Ai = () => {
         }
       }
 
-      // Call different backend endpoints based on mode
+      // Add user message to chat
+      const userMessage = {
+        id: Date.now(),
+        role: 'user',
+        content: userInput,
+        timestamp: new Date().toISOString(),
+        mode: selectedMode,
+        restrictions: selectedRestrictions
+      };
+
+      setMessages(prev => [...prev, userMessage]);
+
+      // For "idea" mode, use streaming
       if (selectedMode === "idea") {
-        response = await aiService.generateRecipe(currentChatId, input, "generate_recipe");
+        setIsStreaming(true);
+        
+        // Initialize the streaming formatter
+        initializeStreamingFormatter();
+        
+        // Add user message to activeChats immediately for display
+        const userChatEntry = {
+          input: userInput,
+          output: "", // Will be filled during streaming
+          restrictions: selectedRestrictions
+            .map((r) => restrictionsList.find((x) => x.id === r)?.label)
+            .join(", ") || "None",
+          mode: selectedMode,
+          timestamp: new Date().toLocaleString(),
+          isStreaming: true
+        };
+        
+        setActiveChats(prev => [...prev, userChatEntry]);
+        
+        // Navigate to the new chat URL after adding the user message (for new chats only)
+        if (!chatId) {
+          navigate(`/ai/${currentChatId}`, { replace: true });
+        }
+        
+        // Add AI message placeholder for streaming
+        const aiMessageId = Date.now() + 1;
+        const aiMessage = {
+          id: aiMessageId,
+          role: 'assistant',
+          content: '',
+          timestamp: new Date().toISOString(),
+          isStreaming: true
+        };
+        
+        setMessages(prev => [...prev, aiMessage]);
+
+        try {
+          await aiService.generateRecipeStream(
+            currentChatId,
+            userInput,
+            "generate_recipe",
+            // onChunk callback
+            (chunkData) => {
+              if (chunkData.chunk) {
+                // Use the new streaming formatter for real-time formatting
+                const formatted = processStreamingChunk(chunkData.chunk);
+                setStreamingOutput(formatted);
+                
+                // Update the AI message in real-time
+                setMessages(prev => prev.map(msg => 
+                  msg.id === aiMessageId 
+                    ? { ...msg, content: formatted }
+                    : msg
+                ));
+                
+                // Update activeChats with streaming content
+                setActiveChats(prev => prev.map((chat, index) => 
+                  index === prev.length - 1 && chat.isStreaming
+                    ? { ...chat, output: formatted }
+                    : chat
+                ));
+              }
+            },
+            // onComplete callback
+            (completeData) => {
+              setIsStreaming(false);
+              
+              // Get final formatted output from the formatter
+              let formattedOutput = "";
+              if (streamingFormatterRef.current) {
+                formattedOutput = streamingFormatterRef.current.getFormattedOutput();
+              }
+              
+              // If no formatted output, try to use the complete data
+              if (!formattedOutput && completeData.data) {
+                formattedOutput = formatRecipeDisplay(completeData.data, selectedMode);
+              }
+              
+              if (!formattedOutput) {
+                formattedOutput = completeData.fullText || "Recipe generated successfully!";
+              }
+
+              // Update the final AI message
+              setMessages(prev => prev.map(msg => 
+                msg.id === aiMessageId 
+                  ? { 
+                      ...msg, 
+                      content: formattedOutput, 
+                      isStreaming: false,
+                      recipeData: completeData.data 
+                    }
+                  : msg
+              ));
+              
+              // Finalize the activeChats entry AND ensure it persists
+              setActiveChats(prev => prev.map((chat, index) => 
+                index === prev.length - 1 && chat.isStreaming
+                  ? { 
+                      ...chat, 
+                      output: formattedOutput,
+                      recipeData: completeData.data,
+                      isStreaming: false
+                    }
+                  : chat
+              ));
+              
+              // Also update the legacy output state for consistency and persistence
+              setOutput(formattedOutput);
+              
+              // Add to history for additional persistence
+              const completedChatEntry = {
+                input: userInput,
+                output: formattedOutput,
+                recipeData: completeData.data,
+                restrictions: selectedRestrictions
+                  .map((r) => restrictionsList.find((x) => x.id === r)?.label)
+                  .join(", ") || "None",
+                mode: selectedMode,
+                timestamp: new Date().toLocaleString()
+              };
+              setHistory(prev => [completedChatEntry, ...prev]);
+              
+              // Clear streaming output
+              setStreamingOutput("");
+              
+              // Refresh chat history to include the updated chat
+              loadChatHistory();
+              
+              // Ensure we're on the correct URL for the chat
+              if (window.location.pathname !== `/ai/${currentChatId}`) {
+                navigate(`/ai/${currentChatId}`, { replace: true });
+              }
+            },
+            // onError callback
+            (error) => {
+              setIsStreaming(false);
+              console.error("Streaming error:", error);
+              
+              const errorMessage = "Sorry, I encountered an error while generating the recipe. Please try again.";
+              
+              // Update AI message with error
+              setMessages(prev => prev.map(msg => 
+                msg.id === aiMessageId 
+                  ? { 
+                      ...msg, 
+                      content: errorMessage,
+                      isStreaming: false,
+                      isError: true
+                    }
+                  : msg
+              ));
+              
+              // Update activeChats with error message
+              setActiveChats(prev => prev.map((chat, index) => 
+                index === prev.length - 1 && chat.isStreaming
+                  ? { 
+                      ...chat, 
+                      output: errorMessage,
+                      isStreaming: false,
+                      isError: true
+                    }
+                  : chat
+              ));
+              
+              setError("Failed to generate recipe: " + error.message);
+              setStreamingOutput("");
+            }
+          );
+
+        } catch (streamingError) {
+          setIsStreaming(false);
+          console.error("Streaming setup error:", streamingError);
+          
+          // Remove the AI message and show error
+          setMessages(prev => prev.filter(msg => msg.id !== aiMessageId));
+          setError("Failed to start recipe generation. Please try again.");
+          setStreamingOutput("");
+        }
+
       } else if (selectedMode === "ingredients") {
-        const ingredients = availableIngredients
+        // For "ingredients" mode, use streaming
+        setIsStreaming(true);
+        
+        // Initialize the streaming formatter
+        initializeStreamingFormatter();
+        
+        // Prepare ingredients - either from availableIngredients field or empty array
+        const ingredientsList = availableIngredients
           ? availableIngredients.split(",").map((i) => i.trim()).filter((i) => i)
           : [];
-        response = await aiService.generateRecipeWithIngredients(
-          currentChatId,
-          input,
-          ingredients,
-          useInventory
-        );
-      } else if (selectedMode === "adapt") {
-        if (recipeId) {
-          response = await aiService.adaptExistingRecipe(currentChatId, null, input, recipeId);
-        } else if (originalRecipe.title) {
-          response = await aiService.adaptExistingRecipe(currentChatId, originalRecipe, input);
-        } else {
-          setError("Please provide either a recipe ID or original recipe details to adapt");
-          setIsLoading(false);
+        
+        // Check if we have any ingredients (from inventory or manual input)
+        if (!useInventory && ingredientsList.length === 0) {
+          setError("Please provide ingredients or enable inventory usage");
+          setIsStreaming(false);
           return;
+        }
+        
+        // Add user message to activeChats immediately for display
+        const userChatEntry = {
+          input: userInput,
+          output: "", // Will be filled during streaming
+          restrictions: selectedRestrictions
+            .map((r) => restrictionsList.find((x) => x.id === r)?.label)
+            .join(", ") || "None",
+          mode: selectedMode,
+          timestamp: new Date().toLocaleString(),
+          isStreaming: true
+        };
+        
+        setActiveChats(prev => [...prev, userChatEntry]);
+        
+        // Navigate to the new chat URL after adding the user message (for new chats only)
+        if (!chatId) {
+          navigate(`/ai/${currentChatId}`, { replace: true });
+        }
+        
+        // Add AI message placeholder for streaming
+        const aiMessageId = Date.now() + 1;
+        const aiMessage = {
+          id: aiMessageId,
+          role: 'assistant',
+          content: '',
+          timestamp: new Date().toISOString(),
+          isStreaming: true
+        };
+        
+        setMessages(prev => [...prev, aiMessage]);
+
+        try {
+          await aiService.generateRecipeWithIngredientsStream(
+            currentChatId,
+            userInput,
+            ingredientsList,
+            useInventory,
+            // onChunk callback
+            (chunkData) => {
+              if (chunkData.chunk) {
+                // Use the new streaming formatter for real-time formatting
+                const formatted = processStreamingChunk(chunkData.chunk);
+                setStreamingOutput(formatted);
+                
+                // Update the AI message in real-time
+                setMessages(prev => prev.map(msg => 
+                  msg.id === aiMessageId 
+                    ? { ...msg, content: formatted }
+                    : msg
+                ));
+                
+                // Update activeChats with streaming content
+                setActiveChats(prev => prev.map((chat, index) => 
+                  index === prev.length - 1 && chat.isStreaming
+                    ? { ...chat, output: formatted }
+                    : chat
+                ));
+              }
+            },
+            // onComplete callback
+            (completeData) => {
+              setIsStreaming(false);
+              
+              // Get final formatted output from the formatter
+              let formattedOutput = "";
+              if (streamingFormatterRef.current) {
+                formattedOutput = streamingFormatterRef.current.getFormattedOutput();
+              }
+              
+              // If no formatted output, try to use the complete data
+              if (!formattedOutput && completeData.data) {
+                formattedOutput = formatRecipeDisplay(completeData.data, selectedMode);
+              }
+              
+              if (!formattedOutput) {
+                formattedOutput = completeData.fullText || "Recipe generated successfully!";
+              }
+
+              // Update the final AI message
+              setMessages(prev => prev.map(msg => 
+                msg.id === aiMessageId 
+                  ? { 
+                      ...msg, 
+                      content: formattedOutput, 
+                      isStreaming: false,
+                      recipeData: completeData.data 
+                    }
+                  : msg
+              ));
+              
+              // Finalize the activeChats entry
+              setActiveChats(prev => prev.map((chat, index) => 
+                index === prev.length - 1 && chat.isStreaming
+                  ? { 
+                      ...chat, 
+                      output: formattedOutput,
+                      recipeData: completeData.data,
+                      isStreaming: false
+                    }
+                  : chat
+              ));
+              
+              // Also update the legacy output state for consistency
+              setOutput(formattedOutput);
+              
+              // Add to history for additional persistence
+              const completedChatEntry = {
+                input: userInput,
+                output: formattedOutput,
+                recipeData: completeData.data,
+                restrictions: selectedRestrictions
+                  .map((r) => restrictionsList.find((x) => x.id === r)?.label)
+                  .join(", ") || "None",
+                mode: selectedMode,
+                timestamp: new Date().toLocaleString()
+              };
+              setHistory(prev => [completedChatEntry, ...prev]);
+              
+              // Clear streaming output
+              setStreamingOutput("");
+              
+              // Refresh chat history to include the updated chat
+              loadChatHistory();
+              
+              // Ensure we're on the correct URL for the chat
+              if (window.location.pathname !== `/ai/${currentChatId}`) {
+                navigate(`/ai/${currentChatId}`, { replace: true });
+              }
+            },
+            // onError callback
+            (error) => {
+              setIsStreaming(false);
+              console.error("Ingredients streaming error:", error);
+              
+              const errorMessage = "Sorry, I encountered an error while generating the recipe with ingredients. Please try again.";
+              
+              // Update AI message with error
+              setMessages(prev => prev.map(msg => 
+                msg.id === aiMessageId 
+                  ? { 
+                      ...msg, 
+                      content: errorMessage,
+                      isStreaming: false,
+                      isError: true
+                    }
+                  : msg
+              ));
+              
+              // Update activeChats with error message
+              setActiveChats(prev => prev.map((chat, index) => 
+                index === prev.length - 1 && chat.isStreaming
+                  ? { 
+                      ...chat, 
+                      output: errorMessage,
+                      isStreaming: false,
+                      isError: true
+                    }
+                  : chat
+              ));
+              
+              setError("Failed to generate recipe with ingredients: " + error.message);
+              setStreamingOutput("");
+            }
+          );
+
+        } catch (streamingError) {
+          setIsStreaming(false);
+          console.error("Ingredients streaming setup error:", streamingError);
+          
+          // Remove the AI message and show error
+          setMessages(prev => prev.filter(msg => msg.id !== aiMessageId));
+          setError("Failed to start recipe generation with ingredients. Please try again.");
+          setStreamingOutput("");
+        }
+
+      } else if (selectedMode === "adapt") {
+        // For "adapt" mode, use streaming
+        console.log("=== ADAPT RECIPE DEBUG START ===");
+        console.log("originalRecipe at start of adapt mode:", originalRecipe);
+        console.log("typeof originalRecipe:", typeof originalRecipe);
+        console.log("userInput:", userInput);
+        console.log("=== ADAPT RECIPE DEBUG END ===");
+        
+        setIsStreaming(true);
+        
+        // Initialize the streaming formatter
+        initializeStreamingFormatter();
+        
+        // Validate adaptation requirements - either originalRecipe title or recipeId
+        if (!originalRecipe.title && !recipeId) {
+          setError("Please provide recipe details or recipe ID to adapt");
+          setIsStreaming(false);
+          return;
+        }
+
+        console.log("Adaptation data:", { recipeId, originalRecipe, hasRecipeId: !!recipeId });
+
+        // Ensure we have a chat to work with
+        let currentChatId = chatId;
+        if (!currentChatId) {
+          try {
+            console.log("Creating new chat for recipe adaptation");
+            const newChat = await createNewChat(userInput);
+            currentChatId = newChat._id;
+            setCurrentChat(newChat);
+            
+            // Navigate to the new chat
+            navigate(`/ai/${currentChatId}`, { replace: true });
+          } catch (error) {
+            console.error("Failed to create chat for adaptation:", error);
+            setError("Failed to create chat session for adaptation");
+            setIsStreaming(false);
+            return;
+          }
+        }
+
+        console.log("Starting recipe adaptation with chat ID:", currentChatId);
+        
+        // Add user message to activeChats immediately for display
+        const userChatEntry = {
+          input: userInput,
+          output: "", // Will be filled during streaming
+          restrictions: selectedRestrictions
+            .map((r) => restrictionsList.find((x) => x.id === r)?.label)
+            .join(", ") || "None",
+          mode: selectedMode,
+          timestamp: new Date().toLocaleString(),
+          isStreaming: true
+        };
+        
+        setActiveChats(prev => [...prev, userChatEntry]);
+        
+        // Navigate to the new chat URL after adding the user message (for new chats only)
+        if (!chatId) {
+          navigate(`/ai/${currentChatId}`, { replace: true });
+        }
+        
+        // Add AI message placeholder for streaming
+        const aiMessageId = Date.now() + 1;
+        const aiMessage = {
+          id: aiMessageId,
+          role: 'assistant',
+          content: '',
+          timestamp: new Date().toISOString(),
+          isStreaming: true
+        };
+        
+        setMessages(prev => [...prev, aiMessage]);
+
+        try {
+          console.log("Starting adapt recipe stream with:", {
+            chatId: currentChatId,
+            recipeId: recipeId,
+            originalRecipeTitle: originalRecipe.title,
+            adaptationRequest: userInput
+          });
+          
+          console.log("Current state:", { originalRecipe, recipeId });
+          
+          await aiService.adaptExistingRecipeStream(
+            currentChatId,
+            recipeId ? null : originalRecipe, // Send null if we have recipeId
+            userInput,
+            recipeId, // Pass recipeId as 4th parameter
+            // onChunk callback
+            (chunkData) => {
+              console.log("Received adapt recipe chunk:", chunkData);
+              if (chunkData.chunk) {
+                // Use the new streaming formatter for real-time formatting
+                const formatted = processStreamingChunk(chunkData.chunk);
+                setStreamingOutput(formatted);
+                
+                // Update the AI message in real-time
+                setMessages(prev => prev.map(msg => 
+                  msg.id === aiMessageId 
+                    ? { ...msg, content: formatted }
+                    : msg
+                ));
+                
+                // Update activeChats with streaming content
+                setActiveChats(prev => prev.map((chat, index) => 
+                  index === prev.length - 1 && chat.isStreaming
+                    ? { ...chat, output: formatted }
+                    : chat
+                ));
+              }
+            },
+            // onComplete callback
+            (completeData) => {
+              console.log("Adapt recipe stream completed:", completeData);
+              setIsStreaming(false);
+              
+              // Get final formatted output from the formatter
+              let formattedOutput = "";
+              if (streamingFormatterRef.current) {
+                formattedOutput = streamingFormatterRef.current.getFormattedOutput();
+              }
+              
+              // If no formatted output, try to use the complete data
+              if (!formattedOutput && completeData.data) {
+                formattedOutput = formatRecipeDisplay(completeData.data, selectedMode);
+              }
+              
+              if (!formattedOutput) {
+                formattedOutput = completeData.fullText || "Recipe adaptation completed successfully!";
+              }
+
+              console.log("Final formatted output:", formattedOutput.substring(0, 100) + "...");
+
+              // Update the final AI message
+              setMessages(prev => prev.map(msg => 
+                msg.id === aiMessageId 
+                  ? { 
+                      ...msg, 
+                      content: formattedOutput, 
+                      isStreaming: false,
+                      recipeData: completeData.data 
+                    }
+                  : msg
+              ));
+              
+              // Finalize the activeChats entry
+              setActiveChats(prev => prev.map((chat, index) => 
+                index === prev.length - 1 && chat.isStreaming
+                  ? { 
+                      ...chat, 
+                      output: formattedOutput,
+                      recipeData: completeData.data,
+                      isStreaming: false
+                    }
+                  : chat
+              ));
+              
+              // Also update the legacy output state for consistency
+              setOutput(formattedOutput);
+              
+              // Add to history for additional persistence
+              const completedChatEntry = {
+                input: userInput,
+                output: formattedOutput,
+                recipeData: completeData.data,
+                restrictions: selectedRestrictions
+                  .map((r) => restrictionsList.find((x) => x.id === r)?.label)
+                  .join(", ") || "None",
+                mode: selectedMode,
+                timestamp: new Date().toLocaleString()
+              };
+              setHistory(prev => [completedChatEntry, ...prev]);
+              
+              // Clear streaming output
+              setStreamingOutput("");
+              
+              // Clear input prompt for next adaptation, but keep recipe data
+              setInput("");
+              
+              // DON'T clear recipe data - keep it so user can adapt the same recipe again
+              // if (recipeId) {
+              //   setRecipeId("");
+              //   setOriginalRecipe({
+              //     title: "",
+              //     ingredients: [],
+              //     instructions: [],
+              //   });
+              // }
+              
+              // Refresh chat history to include the updated chat
+              loadChatHistory();
+              
+              // Ensure we're on the correct URL for the chat
+              if (window.location.pathname !== `/ai/${currentChatId}`) {
+                navigate(`/ai/${currentChatId}`, { replace: true });
+              }
+            },
+            // onError callback
+            (error) => {
+              setIsStreaming(false);
+              console.error("Adapt streaming error:", error);
+              
+              const errorMessage = "Sorry, I encountered an error while adapting the recipe. Please try again.";
+              
+              // Update AI message with error
+              setMessages(prev => prev.map(msg => 
+                msg.id === aiMessageId 
+                  ? { 
+                      ...msg, 
+                      content: errorMessage,
+                      isStreaming: false,
+                      isError: true
+                    }
+                  : msg
+              ));
+              
+              // Update activeChats with error message
+              setActiveChats(prev => prev.map((chat, index) => 
+                index === prev.length - 1 && chat.isStreaming
+                  ? { 
+                      ...chat, 
+                      output: errorMessage,
+                      isStreaming: false,
+                      isError: true
+                    }
+                  : chat
+              ));
+              
+              setError("Failed to adapt recipe: " + error.message);
+              setStreamingOutput("");
+            }
+          );
+
+        } catch (streamingError) {
+          setIsStreaming(false);
+          console.error("Adapt streaming setup error:", streamingError);
+          
+          // Remove the AI message and show error
+          setMessages(prev => prev.filter(msg => msg.id !== aiMessageId));
+          setError("Failed to start recipe adaptation. Please try again.");
+          setStreamingOutput("");
         }
       }
 
-      // Format response for display
-      const recipeData = response.response?.recipeData;
-      let formattedOutput = "";
-
-      if (recipeData && typeof recipeData === "object") {
-        formattedOutput = formatRecipeDisplay(recipeData, selectedMode);
-      } else {
-        formattedOutput = response.response?.content || "Recipe generated successfully!";
-      }
-
-      const newChat = {
-        input,
-        restrictions:
-          selectedRestrictions
-            .map((r) => restrictionsList.find((x) => x.id === r)?.label)
-            .join(", ") || "None",
-        mode: selectedMode,
-        output: formattedOutput,
-        recipeData: recipeData,
-        timestamp: new Date().toLocaleString(),
-      };
-
-      setOutput(formattedOutput);
-      setHistory((prev) => [newChat, ...prev]);
-      setActiveChats((prev) => [...prev, newChat]);
-      setInput("");
-      
-      // Refresh chat history to include the updated chat
-      loadChatHistory();
     } catch (error) {
       console.error("Failed to generate recipe:", error);
       
+      setIsStreaming(false);
+      setStreamingOutput("");
+      
       // Handle different error types
       let errorMessage = "Failed to generate recipe. Please try again.";
-      if (error.code === 'TIMEOUT') {
+      
+      // Check for authentication errors
+      if (error.message?.includes('Authentication') || error.message?.includes('401') || error.message?.includes('Unauthorized')) {
+        errorMessage = "Authentication required. Please log in and try again.";
+        // Optionally redirect to login
+        setTimeout(() => navigate('/'), 2000);
+      } else if (error.code === 'TIMEOUT') {
         errorMessage = "⏱️ " + error.message;
       } else {
         errorMessage = error.message || errorMessage;
@@ -433,18 +1137,18 @@ const Ai = () => {
       
       setError(errorMessage);
 
-      // Fallback response with better timeout messaging
+      // Fallback response with better error messaging
       let fallbackOutput;
       if (error.code === 'TIMEOUT') {
-        fallbackOutput = `⏱️ Recipe Generation Timeout\n\nThe AI is taking longer than expected to generate your recipe. This usually happens with complex requests.\n\nTry:\n• Simplifying your request\n• Being more specific\n• Trying again in a moment\n\nRequest: "${input}"\nMode: ${selectedMode}`;
+        fallbackOutput = `⏱️ Recipe Generation Timeout\n\nThe AI is taking longer than expected to generate your recipe. This usually happens with complex requests.\n\nTry:\n• Simplifying your request\n• Being more specific\n• Trying again in a moment\n\nRequest: "${userInput}"\nMode: ${selectedMode}`;
       } else {
         fallbackOutput = selectedMode === "idea"
-          ? `✨ Recipe Idea for: ${input || "..."}\nRestrictions: ${
+          ? `✨ Recipe Idea for: ${userInput || "..."}\nRestrictions: ${
               selectedRestrictions
                 .map((r) => restrictionsList.find((x) => x.id === r)?.label)
                 .join(", ") || "None"
             }\n\n[API Error: ${error.message}]`
-          : `🍳 Recipe based on ingredients: ${input || "..."}\nRestrictions: ${
+          : `🍳 Recipe based on ingredients: ${userInput || "..."}\nRestrictions: ${
               selectedRestrictions
                 .map((r) => restrictionsList.find((x) => x.id === r)?.label)
                 .join(", ") || "None"
@@ -452,7 +1156,7 @@ const Ai = () => {
       }
 
       const fallbackChat = {
-        input,
+        input: userInput,
         restrictions:
           selectedRestrictions
             .map((r) => restrictionsList.find((x) => x.id === r)?.label)
@@ -465,71 +1169,113 @@ const Ai = () => {
       setOutput(fallbackOutput);
       setHistory((prev) => [fallbackChat, ...prev]);
       setActiveChats((prev) => [...prev, fallbackChat]);
-      setInput("");
     } finally {
       setIsLoading(false);
     }
   };
 
   // Get user name
-  const userName = userData.fullName || "User";
+  const userName = userData?.fullName || "User";
+
+  // Show loading while authentication is being checked
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-[#FFF6E9] via-[#FFDCA9] to-[#FF7F3F]">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-32 w-32 border-b-2 border-[#FF7F3F] mx-auto mb-4"></div>
+          <p className="text-[#FF7F3F] font-semibold">Loading...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Redirect if not authenticated (this should be handled by useEffect, but just in case)
+  if (!isAuthenticated) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-[#FFF6E9] via-[#FFDCA9] to-[#FF7F3F]">
+        <div className="text-center">
+          <p className="text-[#FF7F3F] font-semibold mb-4">Please log in to access ChefAI</p>
+          <button 
+            onClick={() => navigate('/')}
+            className="px-6 py-2 bg-[#FF7F3F] text-white rounded-lg hover:bg-[#E6692E] transition-colors"
+          >
+            Go to Login
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center bg-gradient-to-br from-[#FFF6E9] via-[#FFDCA9] to-[#FF7F3F] dark:from-gray-900 dark:via-gray-800 dark:to-gray-900 px-4 pt-10 pb-40 relative">
-      {/* Header */}
-      <AiHeader
-        showDropdown={showDropdown}
-        setShowDropdown={setShowDropdown}
-        selectedRestrictions={selectedRestrictions}
-        handleRestrictionToggle={handleRestrictionToggle}
-        currentChat={currentChat}
-        startNewChat={startNewChat}
-        setShowHistory={setShowHistory}
-      />
-
-      {/* Greeting */}
-      <AiGreeting
-        userName={userName}
-        output={output}
-        isLoadingChat={isLoadingChat}
-        activeChats={activeChats}
-      />
-
-      {/* Loading previous chat message */}
-      <LoadingChatMessage isLoadingChat={isLoadingChat} />
-
-      {/* Output Area above Input Bar */}
-      <div
-        className="w-full flex flex-col items-center justify-end flex-1"
-        style={{ minHeight: "calc(100vh - 220px)" }}
-      >
-        <ChatMessages activeChats={activeChats} output={output} input={input} />
-        
-        {/* Input Bar */}
-        <AiInput
-          selectedMode={selectedMode}
-          setSelectedMode={setSelectedMode}
-          useInventory={useInventory}
-          setUseInventory={setUseInventory}
-          userInventory={userInventory}
-          availableIngredients={availableIngredients}
-          setAvailableIngredients={setAvailableIngredients}
-          recipeId={recipeId}
-          setRecipeId={setRecipeId}
-          originalRecipe={originalRecipe}
-          setOriginalRecipe={setOriginalRecipe}
-          isLoadingChat={isLoadingChat}
+    <div className="min-h-screen flex flex-col bg-gradient-to-br from-[#FFF6E9] via-[#FFDCA9] to-[#FF7F3F] dark:from-gray-900 dark:via-gray-800 dark:to-gray-900 overflow-x-hidden" style={{scrollbarWidth: 'none', msOverflowStyle: 'none'}}>
+      <style jsx>{`
+        div::-webkit-scrollbar {
+          display: none;
+        }
+      `}</style>
+      {/* Header section */}
+      <div className="w-full flex flex-col items-center px-4 py-8">
+        <AiHeader
+          showDropdown={showDropdown}
+          setShowDropdown={setShowDropdown}
+          selectedRestrictions={selectedRestrictions}
+          handleRestrictionToggle={handleRestrictionToggle}
           currentChat={currentChat}
-          activeChats={activeChats}
-          error={error}
-          input={input}
-          handleInputChange={handleInputChange}
-          isListening={isListening}
-          handleMicClick={handleMicClick}
-          handleImageUpload={handleImageUpload}
-          isLoading={isLoading}
-          handleSubmit={handleSubmit}
+          startNewChat={startNewChat}
+          setShowHistory={setShowHistory}
         />
+
+        <AiGreeting
+          userName={userName}
+          output={output}
+          isLoadingChat={isLoadingChat}
+          activeChats={activeChats}
+        />
+      </div>
+
+      {/* Main content area */}
+      <div className="flex-1 w-full max-w-7xl mx-auto px-4 pb-4">
+        {/* Chat Messages */}
+        {(activeChats.length > 0 || output || isStreaming) && (
+          <div className="mb-4">
+            <ChatMessages 
+              activeChats={activeChats} 
+              output={output} 
+              input={input}
+              isStreaming={isStreaming}
+              streamingOutput={streamingOutput}
+            />
+          </div>
+        )}
+        
+        {/* Input section */}
+        <div className="sticky bottom-4">
+          <AiInput
+            selectedMode={selectedMode}
+            setSelectedMode={setSelectedMode}
+            useInventory={useInventory}
+            setUseInventory={setUseInventory}
+            userInventory={userInventory}
+            availableIngredients={availableIngredients}
+            setAvailableIngredients={setAvailableIngredients}
+            recipeId={recipeId}
+            setRecipeId={setRecipeId}
+            originalRecipe={originalRecipe}
+            setOriginalRecipe={setOriginalRecipe}
+            isLoadingChat={isLoadingChat}
+            currentChat={currentChat}
+            activeChats={activeChats}
+            error={error}
+            input={input}
+            handleInputChange={handleInputChange}
+            isListening={isListening}
+            handleMicClick={handleMicClick}
+            handleImageUpload={handleImageUpload}
+            isLoading={isLoading}
+            isStreaming={isStreaming}
+            handleSubmit={handleSubmit}
+          />
+        </div>
       </div>
 
       {/* Loading Indicator */}

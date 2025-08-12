@@ -7,53 +7,60 @@ const IngredientsInput = ({
   availableIngredients,
   setAvailableIngredients
 }) => {
+  // Get dynamic placeholder text based on inventory usage
+  const getPlaceholderText = () => {
+    if (useInventory && userInventory.length > 0) {
+      return "Add extra ingredients (optional)...";
+    } else if (useInventory && userInventory.length === 0) {
+      return "Your inventory is empty. Add ingredients manually...";
+    } else {
+      return "e.g., tomatoes, onions, garlic, chicken breast...";
+    }
+  };
+
+  const getHelpText = () => {
+    if (useInventory && userInventory.length > 0) {
+      const inventoryItems = userInventory.slice(0, 2).map(item => item.name).join(", ");
+      const extraCount = userInventory.length > 2 ? ` +${userInventory.length - 2} more` : "";
+      return `Using: ${inventoryItems}${extraCount}`;
+    } else if (useInventory && userInventory.length === 0) {
+      return "Inventory empty - add ingredients manually";
+    } else {
+      return "Enter ingredients separated by commas";
+    }
+  };
+
   return (
-    <div className="w-full mb-4 bg-white/20 dark:bg-gray-800/20 rounded-2xl p-4 border border-[#FFDCA9] dark:border-orange-400">
-      {/* Use Inventory Option */}
-      <div className="mb-4">
-        <label className="flex items-center gap-3 cursor-pointer">
+    <div className="w-full bg-white/20 dark:bg-gray-800/20 rounded-xl p-3 border border-[#FFDCA9] dark:border-orange-400">
+      <div className="flex items-center justify-between gap-4">
+        {/* Use Inventory Checkbox */}
+        <label className="flex items-center gap-2 cursor-pointer">
           <input
             type="checkbox"
             checked={useInventory}
             onChange={(e) => setUseInventory(e.target.checked)}
-            className="form-checkbox h-5 w-5 text-[#FF7F3F] dark:text-orange-400 border-[#FFDCA9] dark:border-orange-400 rounded focus:ring-2 focus:ring-[#FFDCA9] dark:focus:ring-orange-400 bg-white dark:bg-gray-900"
+            className="form-checkbox h-4 w-4 text-[#FF7F3F] dark:text-orange-400 border-[#FFDCA9] dark:border-orange-400 rounded focus:ring-1 focus:ring-[#FFDCA9] dark:focus:ring-orange-400 bg-white dark:bg-gray-900"
           />
           <span className="text-sm font-semibold text-[#FF7F3F] dark:text-orange-400">
-            Use My Inventory ({userInventory.length} items)
+            Use Inventory ({userInventory.length})
           </span>
         </label>
-        <p className="text-xs text-[#FF7F3F] dark:text-orange-400 mt-1 opacity-70 ml-8">
-          {useInventory
-            ? "Will use ingredients from your inventory"
-            : "Will use only manually entered ingredients"}
-        </p>
-      </div>
 
-      <label className="block text-sm font-semibold text-[#FF7F3F] dark:text-orange-400 mb-2">
-        {useInventory
-          ? "Additional Ingredients (optional):"
-          : "Available Ingredients (comma separated):"}
-      </label>
-      <textarea
-        value={availableIngredients}
-        onChange={(e) => setAvailableIngredients(e.target.value)}
-        className="w-full p-3 border border-[#FFDCA9] dark:border-orange-400 rounded-lg resize-none bg-white/90 dark:bg-gray-800 text-[#FF7F3F] dark:text-orange-400"
-        rows={3}
-        placeholder={
-          useInventory
-            ? "Additional ingredients to use beyond your inventory..."
-            : "e.g., tomatoes, onions, garlic, chicken breast, olive oil..."
-        }
-      />
-      <p className="text-xs text-[#FF7F3F] dark:text-orange-400 mt-1 opacity-70">
-        {useInventory
-          ? `Your inventory: ${
-              userInventory.map((item) => item.name).join(", ") ||
-              "No items"
-            }`
-          : userInventory.length > 0
-          ? `Available in inventory: ${userInventory.length} items`
-          : "No inventory items found"}
+        {/* Ingredients Input */}
+        <div className="flex-1">
+          <input
+            type="text"
+            value={availableIngredients}
+            onChange={(e) => setAvailableIngredients(e.target.value)}
+            className="w-full p-2 border border-[#FFDCA9] dark:border-orange-400 rounded-lg bg-white/90 dark:bg-gray-800 text-[#FF7F3F] dark:text-orange-400 focus:outline-none focus:ring-1 focus:ring-[#FF7F3F] dark:focus:ring-orange-400 text-sm"
+            placeholder={getPlaceholderText()}
+          />
+        </div>
+      </div>
+      
+      {/* Compact help text */}
+      <p className="text-xs text-[#FF7F3F]/70 dark:text-orange-400/70 mt-1">
+        {getHelpText()}
       </p>
     </div>
   );
