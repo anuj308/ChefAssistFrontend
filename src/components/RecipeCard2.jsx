@@ -1,8 +1,9 @@
 import { useNavigate } from "react-router-dom";
 import { useState, useEffect } from "react";
-import { Star, Clock, Bookmark as BookmarkIcon, Eye, Sparkles } from "lucide-react";
+import { Star, Clock, Bookmark as BookmarkIcon, Eye, Sparkles, Users } from "lucide-react";
 import { toast } from "react-toastify";
 import userService from "../api/userService.js";
+import followService from "../api/followService.js";
 
 const RecipeCard2 = ({ recipe, onRemoveFromSaved, initialSaved = false }) => {
   const navigate = useNavigate();
@@ -10,6 +11,7 @@ const RecipeCard2 = ({ recipe, onRemoveFromSaved, initialSaved = false }) => {
   const [isLoading, setIsLoading] = useState(false);
   const [isHovered, setIsHovered] = useState(false);
   const [checkedSaveStatus, setCheckedSaveStatus] = useState(initialSaved);
+  const [followerCount, setFollowerCount] = useState(recipe.author?.followersCount || 0);
 
   // Check if recipe is already saved when component mounts (only if not already marked as saved)
   useEffect(() => {
@@ -34,6 +36,13 @@ const RecipeCard2 = ({ recipe, onRemoveFromSaved, initialSaved = false }) => {
       checkIfSaved();
     }
   }, [recipe._id, initialSaved, checkedSaveStatus]);
+
+  // Update follower count when recipe data changes
+  useEffect(() => {
+    if (recipe.author?.followersCount !== undefined) {
+      setFollowerCount(recipe.author.followersCount);
+    }
+  }, [recipe.author?.followersCount]);
 
   // Check save status on hover if not already checked
   const handleMouseEnter = async () => {
@@ -150,21 +159,11 @@ Please adapt this recipe based on my dietary preferences and restrictions. You c
           alt={recipe.title || 'Recipe'}
           className="w-full h-40 object-cover"
         />
-        <div className="absolute top-2 right-2 flex gap-2">
-          {(recipe.badges || recipe.tags || []).map((badge, index) => (
-            <span
-              key={`${recipe._id}-${badge}-${index}`}
-              className="bg-black/50 text-white text-xs font-semibold px-2 py-1 rounded-full backdrop-blur-sm"
-            >
-              {badge}
-            </span>
-          ))}
-        </div>
         <button 
           onClick={handleSaveRecipe}
           disabled={isLoading}
           className={`absolute top-2 left-2 p-2 rounded-full backdrop-blur-sm transition-all duration-200 ${
-            isHovered || isSaved ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+            isHovered || isSaved ? 'opacity-100' : 'opacity-100 md:opacity-0 md:group-hover:opacity-100'
           } ${
             isSaved 
               ? 'bg-[var(--color-chef-peach)]/90 text-white' 
@@ -210,8 +209,9 @@ Please adapt this recipe based on my dietary preferences and restrictions. You c
               <span className="font-semibold hover:underline">
                 {recipe.author?.username || recipe.author?.name || 'Anonymous Chef'}
               </span>
-              <div className="text-xs">
-                {(recipe.author?.followers || 0).toLocaleString()} Followers
+              <div className="text-xs flex items-center gap-1">
+                <Users className="w-3 h-3" />
+                {followerCount.toLocaleString()} Followers
               </div>
             </div>
           </div>
@@ -219,7 +219,7 @@ Please adapt this recipe based on my dietary preferences and restrictions. You c
           {/* AI Adapt button positioned at the end of author section */}
           <button
             onClick={handleAdaptRecipe}
-            className="opacity-0 group-hover:opacity-100 px-2 py-1 bg-gradient-to-r from-purple-50 to-indigo-50 dark:from-purple-900/20 dark:to-indigo-900/20 hover:from-purple-100 hover:to-indigo-100 dark:hover:from-purple-800/30 dark:hover:to-indigo-800/30 text-purple-600 dark:text-purple-400 hover:text-purple-700 dark:hover:text-purple-300 rounded-md transition-all duration-200 text-xs font-medium flex items-center gap-1"
+            className="opacity-100 md:opacity-0 md:group-hover:opacity-100 px-2 py-1 bg-gradient-to-r from-purple-50 to-indigo-50 dark:from-purple-900/20 dark:to-indigo-900/20 hover:from-purple-100 hover:to-indigo-100 dark:hover:from-purple-800/30 dark:hover:to-indigo-800/30 text-purple-600 dark:text-purple-400 hover:text-purple-700 dark:hover:text-purple-300 rounded-md transition-all duration-200 text-xs font-medium flex items-center gap-1"
             title="Adapt recipe with AI"
           >
             <Sparkles className="w-3 h-3" />
